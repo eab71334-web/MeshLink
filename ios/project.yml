@@ -1,0 +1,27 @@
+name: MeshLink
+options:
+  bundleIdPrefix: com.meshlink
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  MeshLink:
+    type: application
+    platform: iOS
+    sources:
+      - MeshLink
+    info:
+      path: MeshLink/Info.plist
+      properties:
+        CFBundleDisplayName: MeshLink
+        UILaunchScreen: {}
+        NSBluetoothAlwaysUsageDescription: "MeshLink uses Bluetooth to chat with nearby devices."
+        UIBackgroundModes:
+          - bluetooth-central
+          - bluetooth-peripheral
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.meshlink.app
+        SWIFT_VERSION: "5.0"
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1"
