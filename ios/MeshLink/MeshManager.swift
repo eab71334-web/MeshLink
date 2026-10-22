@@ -10,7 +10,7 @@ struct ChatMessage: Identifiable {
 
 private let serviceUUID = CBUUID(string: "6E4D4C01-0000-1000-8000-00805F9B34FB")
 private let charUUID = CBUUID(string: "6E4D4C02-0000-1000-8000-00805F9B34FB")
-private let maxPacket = 244
+private let maxPacket = 180
 private let defaultTTL: UInt8 = 7
 
 final class MeshManager: NSObject, ObservableObject,
@@ -146,6 +146,12 @@ final class MeshManager: NSObject, ObservableObject,
         guard let ch = s.characteristics?.first(where: { $0.uuid == charUUID }) else { return }
         links[p.identifier] = (p, ch)
         peerCount = links.count
+        // لاستقبال الرسائل القادمة من الطرف الآخر عبر نفس الاتصال
+        p.setNotifyValue(true, for: ch)
+    }
+
+    func peripheral(_ p: CBPeripheral, didUpdateValueFor ch: CBCharacteristic, error: Error?) {
+        if let v = ch.value { handle(v) }
     }
 
     // MARK: Peripheral (الإعلان واستقبال الكتابة)
