@@ -4,6 +4,8 @@ import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.bluetooth.le.*
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelUuid
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
@@ -19,7 +21,9 @@ private fun ByteArray.toHex() = joinToString("") { "%02x".format(it) }
 
 /**
  * كل هاتف: يعلن عن نفسه (Peripheral) + يبحث ويتصل بالجيران (Central).
- * الإرسال = كتابة على characteristic عند كل جار متصل.
+ * الإرسال:
+ *  - للأجهزة التي اتصلنا بها نحن: كتابة (write) على الـ characteristic.
+ *  - للأجهزة التي اتصلت بنا (مثل iPhone): إشعار (notify) عبر نفس الاتصال.
  * التوجيه = Flooding مع TTL ومنع التكرار.
  */
 @SuppressLint("MissingPermission")
@@ -28,7 +32,8 @@ class MeshManager(private val ctx: Context) {
     companion object {
         val SERVICE_UUID: UUID = UUID.fromString("6E4D4C01-0000-1000-8000-00805F9B34FB")
         val CHAR_UUID: UUID = UUID.fromString("6E4D4C02-0000-1000-8000-00805F9B34FB")
-        const val MAX_PACKET = 244
+        val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805F9B34FB")
+        const val MAX_PACKET = 180
         const val DEFAULT_TTL = 7
     }
 
@@ -37,6 +42,7 @@ class MeshManager(private val ctx: Context) {
         val busy = AtomicBoolean(false)
     }
 
+    private val handler = Handler(Looper.getMainLooper())
     private val prefs = ctx.getSharedPreferences("mesh", Context.MODE_PRIVATE)
     val myId: ByteArray = loadId()
     val nick: String = "User-" + myId.copyOf(2).toHex()
@@ -45,13 +51,21 @@ class MeshManager(private val ctx: Context) {
     val peers = MutableStateFlow(0)
     val status = MutableStateFlow("Idle")
 
+    // اتصالات نحن بدأناها (Central)
     private val clients = ConcurrentHashMap<String, Conn>()
     private val connecting = ConcurrentHashMap.newKeySet<String>()
+    private val discovering = ConcurrentHashMap.newKeySet<String>()
+    // أجهزة اتصلت بنا واشتركت في الإشعارات (مثل iPhone)
+    private val subscribers = ConcurrentHashMap<String, BluetoothDevice>()
+    private val notifyQueue = ConcurrentLinkedQueue<Pair<BluetoothDevice, ByteArray>>()
+    private val notifyBusy = AtomicBoolean(false)
+
     private val seen = object : LinkedHashMap<String, Boolean>() {
         override fun removeEldestEntry(e: MutableMap.MutableEntry<String, Boolean>?) = size > 2000
     }
 
     private var server: BluetoothGattServer? = null
+    private var serverChar: BluetoothGattCharacteristic? = null
     private var adv: BluetoothLeAdvertiser? = null
     private var scanner: BluetoothLeScanner? = null
     private var started = false
@@ -66,6 +80,8 @@ class MeshManager(private val ctx: Context) {
         return id
     }
 
+    private fun updatePeers() { peers.value = clients.size + subscribers.size }
+
     // ---------- start / stop ----------
     fun start() {
         if (started) return
@@ -79,13 +95,21 @@ class MeshManager(private val ctx: Context) {
 
         server = bm.openGattServer(ctx, serverCb)
         val svc = BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
-        svc.addCharacteristic(
-            BluetoothGattCharacteristic(
-                CHAR_UUID,
-                BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
-                BluetoothGattCharacteristic.PERMISSION_WRITE
+        val ch = BluetoothGattCharacteristic(
+            CHAR_UUID,
+            BluetoothGattCharacteristic.PROPERTY_WRITE or
+                BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE or
+                BluetoothGattCharacteristic.PROPERTY_NOTIFY,
+            BluetoothGattCharacteristic.PERMISSION_WRITE
+        )
+        ch.addDescriptor(
+            BluetoothGattDescriptor(
+                CCCD_UUID,
+                BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE
             )
         )
+        svc.addCharacteristic(ch)
+        serverChar = ch
         server?.addService(svc)
 
         adv = adapter.bluetoothLeAdvertiser
@@ -102,9 +126,10 @@ class MeshManager(private val ctx: Context) {
             advCb
         )
 
+        // بدون فلتر في العتاد (بعض الهواتف فيها خلل)، والفلترة تتم يدوياً في onScanResult
         scanner = adapter.bluetoothLeScanner
         scanner?.startScan(
-            listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE_UUID)).build()),
+            null,
             ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(),
             scanCb
         )
@@ -119,6 +144,8 @@ class MeshManager(private val ctx: Context) {
         clients.values.forEach { runCatching { it.gatt.close() } }
         clients.clear()
         connecting.clear()
+        discovering.clear()
+        subscribers.clear()
         runCatching { server?.close() }
         peers.value = 0
     }
@@ -156,6 +183,8 @@ class MeshManager(private val ctx: Context) {
 
     private fun forward(bytes: ByteArray) {
         clients.values.forEach { c -> c.queue.add(bytes); pump(c) }
+        subscribers.values.forEach { d -> notifyQueue.add(d to bytes) }
+        pumpNotify()
     }
 
     @Suppress("DEPRECATION")
@@ -166,6 +195,17 @@ class MeshManager(private val ctx: Context) {
         c.ch.value = next
         c.ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         if (!c.gatt.writeCharacteristic(c.ch)) c.busy.set(false)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun pumpNotify() {
+        val ch = serverChar ?: return
+        if (!notifyBusy.compareAndSet(false, true)) return
+        val next = notifyQueue.poll()
+        if (next == null) { notifyBusy.set(false); return }
+        ch.value = next.second
+        val ok = server?.notifyCharacteristicChanged(next.first, ch, false) ?: false
+        if (!ok) { notifyBusy.set(false); pumpNotify() }
     }
 
     private fun buildPayload(text: String): ByteArray {
@@ -189,6 +229,13 @@ class MeshManager(private val ctx: Context) {
     }
 
     private val serverCb = object : BluetoothGattServerCallback() {
+        override fun onConnectionStateChange(device: BluetoothDevice, st: Int, newState: Int) {
+            if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                subscribers.remove(device.address)
+                updatePeers()
+            }
+        }
+
         override fun onCharacteristicWriteRequest(
             device: BluetoothDevice, requestId: Int, characteristic: BluetoothGattCharacteristic,
             preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray?
@@ -196,12 +243,33 @@ class MeshManager(private val ctx: Context) {
             if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
             if (value != null) handle(value)
         }
+
+        override fun onDescriptorWriteRequest(
+            device: BluetoothDevice, requestId: Int, descriptor: BluetoothGattDescriptor,
+            preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray?
+        ) {
+            if (descriptor.uuid == CCCD_UUID) {
+                val on = value != null && value.isNotEmpty() && value[0].toInt() != 0
+                if (on) subscribers[device.address] = device else subscribers.remove(device.address)
+                updatePeers()
+                status.value = if (on) "Peer subscribed: ${device.address}" else status.value
+            }
+            if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
+        }
+
+        override fun onNotificationSent(device: BluetoothDevice, st: Int) {
+            notifyBusy.set(false)
+            pumpNotify()
+        }
     }
 
     private val scanCb = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
+            val uuids = result.scanRecord?.serviceUuids ?: return
+            if (uuids.none { it.uuid == SERVICE_UUID }) return
             val addr = result.device.address
             if (clients.containsKey(addr) || !connecting.add(addr)) return
+            status.value = "Found $addr, connecting…"
             result.device.connectGatt(ctx, false, gattCb, BluetoothDevice.TRANSPORT_LE)
         }
         override fun onScanFailed(errorCode: Int) { status.value = "Scan failed: $errorCode" }
@@ -211,22 +279,36 @@ class MeshManager(private val ctx: Context) {
         override fun onConnectionStateChange(g: BluetoothGatt, st: Int, newState: Int) {
             val addr = g.device.address
             if (newState == BluetoothProfile.STATE_CONNECTED && st == BluetoothGatt.GATT_SUCCESS) {
+                status.value = "Connected $addr, discovering…"
                 g.requestMtu(247)
+                // احتياط: بعض الأجهزة ما ترجع onMtuChanged
+                handler.postDelayed({
+                    if (connecting.contains(addr) && discovering.add(addr)) g.discoverServices()
+                }, 1500)
             } else {
+                if (st != BluetoothGatt.GATT_SUCCESS) status.value = "Connection to $addr failed ($st)"
                 g.close()
                 clients.remove(addr)
                 connecting.remove(addr)
-                peers.value = clients.size
+                discovering.remove(addr)
+                updatePeers()
             }
         }
 
-        override fun onMtuChanged(g: BluetoothGatt, mtu: Int, st: Int) { g.discoverServices() }
+        override fun onMtuChanged(g: BluetoothGatt, mtu: Int, st: Int) {
+            if (discovering.add(g.device.address)) g.discoverServices()
+        }
 
         override fun onServicesDiscovered(g: BluetoothGatt, st: Int) {
             val ch = g.getService(SERVICE_UUID)?.getCharacteristic(CHAR_UUID)
-            if (ch == null) { g.disconnect(); return }
+            if (st != BluetoothGatt.GATT_SUCCESS || ch == null) {
+                status.value = "Service not found on ${g.device.address} ($st)"
+                g.disconnect()
+                return
+            }
             clients[g.device.address] = Conn(g, ch)
-            peers.value = clients.size
+            status.value = "Linked with ${g.device.address}"
+            updatePeers()
         }
 
         override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, st: Int) {
