@@ -3,76 +3,78 @@ name: Build
 on:
   push:
     branches: [main]
-  pull_request:
   workflow_dispatch:
 
 jobs:
+  unpack:
+    name: Unpack project
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack MeshLink.zip
+        run: |
+          if [ ! -f MeshLink.zip ]; then echo "No zip, skipping"; exit 0; fi
+          unzip -q -o MeshLink.zip -d /tmp/ml
+          rm -rf /tmp/ml/MeshLink/.github
+          cp -a /tmp/ml/MeshLink/. .
+          rm MeshLink.zip
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A
+          git commit -m "Unpack MeshLink project files" || true
+          git push
+
   android:
     name: Android APK
+    needs: unpack
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Check Android project exists
-        id: check
-        run: |
-          if [ -f android/gradlew ]; then echo "found=true" >> "$GITHUB_OUTPUT"; else echo "found=false" >> "$GITHUB_OUTPUT"; echo "No Android project yet, skipping."; fi
-
+        with:
+          ref: ${{ github.ref }}
       - uses: actions/setup-java@v4
-        if: steps.check.outputs.found == 'true'
         with:
           distribution: temurin
           java-version: 17
-
       - uses: gradle/actions/setup-gradle@v4
-        if: steps.check.outputs.found == 'true'
-
+        with:
+          gradle-version: "8.9"
       - name: Build debug APK
-        if: steps.check.outputs.found == 'true'
         working-directory: android
-        run: |
-          chmod +x gradlew
-          ./gradlew assembleDebug
-
-      - name: Upload APK
-        if: steps.check.outputs.found == 'true'
-        uses: actions/upload-artifact@v4
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
         with:
           name: MeshLink-debug-apk
           path: android/app/build/outputs/apk/debug/*.apk
 
   ios:
     name: iOS IPA (unsigned)
+    needs: unpack
     runs-on: macos-latest
     env:
       SCHEME: MeshLink
-      PROJECT: ios/MeshLink.xcodeproj
     steps:
       - uses: actions/checkout@v4
-
-      - name: Check iOS project exists
-        id: check
+        with:
+          ref: ${{ github.ref }}
+      - name: Generate Xcode project
         run: |
-          if [ -d "$PROJECT" ]; then echo "found=true" >> "$GITHUB_OUTPUT"; else echo "found=false" >> "$GITHUB_OUTPUT"; echo "No iOS project yet, skipping."; fi
-
+          brew install xcodegen
+          cd ios && xcodegen generate
       - name: Build (no code signing)
-        if: steps.check.outputs.found == 'true'
         run: |
-          xcodebuild -project "$PROJECT" -scheme "$SCHEME" \
+          xcodebuild -project ios/MeshLink.xcodeproj -scheme "$SCHEME" \
             -sdk iphoneos -configuration Release \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
-
       - name: Package unsigned IPA
-        if: steps.check.outputs.found == 'true'
         run: |
           mkdir -p Payload
           cp -R "build/Build/Products/Release-iphoneos/$SCHEME.app" Payload/
           zip -qr "$SCHEME-unsigned.ipa" Payload
-
-      - name: Upload IPA
-        if: steps.check.outputs.found == 'true'
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: MeshLink-unsigned-ipa
           path: "*.ipa"
