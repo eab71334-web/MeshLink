@@ -2,6 +2,13 @@ package com.meshlink
 
 import java.nio.ByteBuffer
 
+object PType {
+    const val PUBLIC = 0    // رسالة عامة (نص غير مشفر)
+    const val ACK = 1       // تأكيد استلام رسالة خاصة
+    const val ANNOUNCE = 2  // إعلان: الاسم + المفتاح العام
+    const val PRIVATE = 3   // رسالة خاصة مشفرة
+}
+
 /** شكل الرسالة حسب docs/PROTOCOL.md (الترويسة 45 بايت). */
 class Packet(
     val type: Int,

@@ -15,16 +15,11 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 
-data class ChatMsg(val nick: String, val text: String, val mine: Boolean)
-
-private fun ByteArray.toHex() = joinToString("") { "%02x".format(it) }
-
 /**
- * كل هاتف: يعلن عن نفسه (Peripheral) + يبحث ويتصل بالجيران (Central).
- * الإرسال:
- *  - للأجهزة التي اتصلنا بها نحن: كتابة (write) على الـ characteristic.
- *  - للأجهزة التي اتصلت بنا (مثل iPhone): إشعار (notify) عبر نفس الاتصال.
- * التوجيه = Flooding مع TTL ومنع التكرار.
+ * قلب التطبيق: BLE (Central + Peripheral) + توجيه Flooding + تشفير + تخزين وإعادة إرسال.
+ * - رسائل عامة: غير مشفرة.
+ * - رسائل خاصة: X25519 + ChaCha20-Poly1305 من طرف لطرف.
+ * - Store-and-Forward: كل جهاز يحتفظ بالرسائل ويسلمها لأي جار جديد.
  */
 @SuppressLint("MissingPermission")
 class MeshManager(private val ctx: Context) {
@@ -35,6 +30,9 @@ class MeshManager(private val ctx: Context) {
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805F9B34FB")
         const val MAX_PACKET = 180
         const val DEFAULT_TTL = 7
+        const val STORE_MAX = 150
+        const val STORE_TTL_MS = 6 * 3600 * 1000L
+        const val ANNOUNCE_MS = 25_000L
     }
 
     private class Conn(val gatt: BluetoothGatt, val ch: BluetoothGattCharacteristic) {
@@ -43,26 +41,46 @@ class MeshManager(private val ctx: Context) {
     }
 
     private val handler = Handler(Looper.getMainLooper())
-    private val prefs = ctx.getSharedPreferences("mesh", Context.MODE_PRIVATE)
-    val myId: ByteArray = loadId()
-    val nick: String = "User-" + myId.copyOf(2).toHex()
+    private val storage = Storage(ctx)
+    private val rng = SecureRandom()
 
-    val messages = MutableStateFlow<List<ChatMsg>>(emptyList())
-    val peers = MutableStateFlow(0)
+    // ---- الهوية ----
+    val identity: Crypto.KeyPair = storage.privKey
+        ?.let { runCatching { Crypto.fromPriv(b64d(it)) }.getOrNull() }
+        ?: Crypto.generate().also { storage.privKey = b64e(it.priv) }
+    val myId: ByteArray = identity.pub.copyOf(8)
+    val myIdHex: String = myId.toHex()
+
+    // ---- الحالة (تقرأها الواجهة) ----
+    val nickname = MutableStateFlow(storage.nickname ?: ("User-" + myIdHex.take(4)))
+    val messages = MutableStateFlow(storage.loadMessages())
+    val peers = MutableStateFlow<List<Peer>>(emptyList())
+    val links = MutableStateFlow(0)
     val status = MutableStateFlow("Idle")
+    val unread = MutableStateFlow<Map<String, Int>>(emptyMap())
 
-    // اتصالات نحن بدأناها (Central)
+    @Volatile var currentConvo: String? = null
+    @Volatile var appVisible = false
+    var onIncoming: ((ChatMsg) -> Unit)? = null
+    var onboarded: Boolean
+        get() = storage.onboarded
+        set(v) { storage.onboarded = v }
+
+    // ---- داخلي ----
+    private val peerMap = ConcurrentHashMap<String, Peer>()
+    private val keyCache = ConcurrentHashMap<String, ByteArray>()
+    private val store = LinkedHashMap<String, StoredPacket>()
+    private val pendingPriv = ArrayList<Packet>()
+    private val seen = object : LinkedHashMap<String, Boolean>() {
+        override fun removeEldestEntry(e: MutableMap.MutableEntry<String, Boolean>?) = size > 3000
+    }
+
     private val clients = ConcurrentHashMap<String, Conn>()
     private val connecting = ConcurrentHashMap.newKeySet<String>()
     private val discovering = ConcurrentHashMap.newKeySet<String>()
-    // أجهزة اتصلت بنا واشتركت في الإشعارات (مثل iPhone)
     private val subscribers = ConcurrentHashMap<String, BluetoothDevice>()
     private val notifyQueue = ConcurrentLinkedQueue<Pair<BluetoothDevice, ByteArray>>()
     private val notifyBusy = AtomicBoolean(false)
-
-    private val seen = object : LinkedHashMap<String, Boolean>() {
-        override fun removeEldestEntry(e: MutableMap.MutableEntry<String, Boolean>?) = size > 2000
-    }
 
     private var server: BluetoothGattServer? = null
     private var serverChar: BluetoothGattCharacteristic? = null
@@ -70,19 +88,18 @@ class MeshManager(private val ctx: Context) {
     private var scanner: BluetoothLeScanner? = null
     private var started = false
 
-    private fun loadId(): ByteArray {
-        val saved = prefs.getString("id", null)
-        if (saved != null && saved.length == 16) {
-            return ByteArray(8) { saved.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
-        }
-        val id = ByteArray(8).also { SecureRandom().nextBytes(it) }
-        prefs.edit().putString("id", id.toHex()).apply()
-        return id
+    init {
+        storage.loadPeers().forEach { peerMap[it.id] = it }
+        publishPeers()
+        storage.loadStore().forEach { store[it.id] = it }
     }
 
-    private fun updatePeers() { peers.value = clients.size + subscribers.size }
+    private fun now() = System.currentTimeMillis()
+    private fun rand16() = ByteArray(16).also { rng.nextBytes(it) }
+    private fun publishPeers() { peers.value = peerMap.values.sortedByDescending { it.lastSeen } }
+    private fun updateLinks() { links.value = clients.size + subscribers.size }
 
-    // ---------- start / stop ----------
+    // ---------- تشغيل / إيقاف ----------
     fun start() {
         if (started) return
         val bm = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -126,20 +143,26 @@ class MeshManager(private val ctx: Context) {
             advCb
         )
 
-        // بدون فلتر في العتاد (بعض الهواتف فيها خلل)، والفلترة تتم يدوياً في onScanResult
         scanner = adapter.bluetoothLeScanner
+        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+        // 1) بفلتر (يستمر والشاشة مطفأة)
         scanner?.startScan(
-            null,
-            ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(),
-            scanCb
+            listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE_UUID)).build()),
+            settings, scanCbFiltered
         )
-        status.value = "Running as $nick"
+        // 2) بدون فلتر (للهواتف اللي فلترها معطل) والفحص يدوياً
+        scanner?.startScan(null, settings, scanCbOpen)
+
+        status.value = "Running as ${nickname.value}"
+        handler.postDelayed(announceTask, 2000)
     }
 
     fun stop() {
         if (!started) return
         started = false
-        runCatching { scanner?.stopScan(scanCb) }
+        handler.removeCallbacks(announceTask)
+        runCatching { scanner?.stopScan(scanCbFiltered) }
+        runCatching { scanner?.stopScan(scanCbOpen) }
         runCatching { adv?.stopAdvertising(advCb) }
         clients.values.forEach { runCatching { it.gatt.close() } }
         clients.clear()
@@ -147,33 +170,157 @@ class MeshManager(private val ctx: Context) {
         discovering.clear()
         subscribers.clear()
         runCatching { server?.close() }
-        peers.value = 0
+        links.value = 0
     }
 
-    // ---------- send / receive ----------
-    fun send(text: String) {
-        val t = text.trim()
+    private val announceTask = object : Runnable {
+        override fun run() {
+            if (!started) return
+            announce()
+            handler.postDelayed(this, ANNOUNCE_MS)
+        }
+    }
+
+    // ---------- الواجهة العامة ----------
+    fun setNickname(name: String) {
+        val n = name.trim().take(16)
+        if (n.isEmpty()) return
+        nickname.value = n
+        storage.nickname = n
+        announce()
+    }
+
+    fun markRead(convo: String) { unread.update { it - convo } }
+
+    fun sendPublic(text: String) {
+        val nb = fit(nickname.value, 16).toByteArray(Charsets.UTF_8)
+        val t = fit(text.trim(), MAX_PACKET - Packet.HEADER - 1 - nb.size)
         if (t.isEmpty()) return
-        val payload = buildPayload(t)
-        val p = Packet(
-            0, DEFAULT_TTL,
-            ByteArray(16).also { SecureRandom().nextBytes(it) },
-            myId, Packet.BROADCAST, System.currentTimeMillis(), payload
-        )
-        markSeen(p.id.toHex())
-        messages.update { it + ChatMsg(nick, t, true) }
+        val payload = byteArrayOf(nb.size.toByte()) + nb + t.toByteArray(Charsets.UTF_8)
+        val p = newPacket(PType.PUBLIC, Packet.BROADCAST, payload)
+        addMessage(ChatMsg(p.id.toHex(), PUBLIC, nickname.value, t, true, now()))
+        storeAdd(p)
         forward(p.encode())
     }
 
+    fun sendPrivate(peerHex: String, text: String) {
+        val peer = peerMap[peerHex] ?: return
+        val t = fit(text.trim(), MAX_PACKET - Packet.HEADER - 28)
+        if (t.isEmpty()) return
+        val peerId = peer.key.copyOf(8)
+        val payload = Crypto.seal(keyFor(peer), t.toByteArray(Charsets.UTF_8), myId + peerId)
+        val p = newPacket(PType.PRIVATE, peerId, payload)
+        addMessage(ChatMsg(p.id.toHex(), peerHex, nickname.value, t, true, now(), false))
+        storeAdd(p)
+        forward(p.encode())
+    }
+
+    // ---------- بناء الرسائل ----------
+    private fun fit(s: String, maxBytes: Int): String {
+        var t = s
+        while (t.toByteArray(Charsets.UTF_8).size > maxBytes && t.isNotEmpty()) t = t.dropLast(1)
+        return t
+    }
+
+    private fun newPacket(type: Int, recipient: ByteArray, payload: ByteArray): Packet {
+        val p = Packet(type, DEFAULT_TTL, rand16(), myId, recipient, now(), payload)
+        markSeen(p.id.toHex())
+        return p
+    }
+
+    private fun keyFor(peer: Peer): ByteArray =
+        keyCache.getOrPut(peer.id) { Crypto.sharedKey(identity.priv, peer.key) }
+
+    fun announce() {
+        val nb = fit(nickname.value, 16).toByteArray(Charsets.UTF_8)
+        val payload = byteArrayOf(nb.size.toByte()) + nb + identity.pub
+        val p = newPacket(PType.ANNOUNCE, Packet.BROADCAST, payload)
+        forward(p.encode())
+    }
+
+    private fun sendAck(orig: Packet) {
+        val a = Packet(PType.ACK, DEFAULT_TTL, rand16(), myId, orig.sender, now(), orig.id)
+        markSeen(a.id.toHex())
+        forward(a.encode())
+    }
+
+    // ---------- الاستقبال ----------
     private fun handle(data: ByteArray) {
         val p = Packet.decode(data) ?: return
         if (!markSeen(p.id.toHex())) return
+        if (p.sender.contentEquals(myId)) return
         val forMe = p.recipient.contentEquals(Packet.BROADCAST) || p.recipient.contentEquals(myId)
-        if (p.type == 0 && forMe) {
-            parsePayload(p.payload)?.let { (n, t) -> messages.update { it + ChatMsg(n, t, false) } }
+
+        when (p.type) {
+            PType.PUBLIC -> if (forMe) handlePublic(p)
+            PType.ANNOUNCE -> handleAnnounce(p)
+            PType.PRIVATE -> if (p.recipient.contentEquals(myId)) processPrivate(p)
+            PType.ACK -> handleAck(p)
         }
+
         if (p.ttl > 0 && !p.recipient.contentEquals(myId)) {
-            forward(p.withTtl(p.ttl - 1).encode())
+            val fwd = p.withTtl(p.ttl - 1)
+            if (p.type == PType.PUBLIC || p.type == PType.PRIVATE) storeAdd(fwd)
+            forward(fwd.encode())
+        }
+    }
+
+    private fun handlePublic(p: Packet) {
+        val d = p.payload
+        if (d.isEmpty()) return
+        val nl = d[0].toInt() and 0xFF
+        if (d.size < 1 + nl) return
+        val n = String(d, 1, nl, Charsets.UTF_8)
+        val t = String(d, 1 + nl, d.size - 1 - nl, Charsets.UTF_8)
+        addMessage(ChatMsg(p.id.toHex(), PUBLIC, n, t, false, now()))
+    }
+
+    private fun handleAnnounce(p: Packet) {
+        val d = p.payload
+        if (d.isEmpty()) return
+        val nl = d[0].toInt() and 0xFF
+        if (d.size != 1 + nl + 32) return
+        val nick = String(d, 1, nl, Charsets.UTF_8)
+        val key = d.copyOfRange(1 + nl, d.size)
+        if (!key.copyOf(8).contentEquals(p.sender)) return
+        val id = p.sender.toHex()
+        val old = peerMap[id]
+        peerMap[id] = Peer(id, nick, key, now())
+        val changed = old == null || old.nick != nick || !old.key.contentEquals(key)
+        if (changed) {
+            keyCache.remove(id)
+            storage.savePeers(peerMap.values.toList())
+        }
+        publishPeers()
+        // رسائل خاصة وصلت قبل ما نعرف مرسلها
+        val retry = synchronized(pendingPriv) {
+            val r = pendingPriv.filter { it.sender.contentEquals(p.sender) }
+            pendingPriv.removeAll { it.sender.contentEquals(p.sender) }
+            r
+        }
+        retry.forEach { processPrivate(it) }
+    }
+
+    private fun processPrivate(p: Packet) {
+        val sid = p.sender.toHex()
+        val peer = peerMap[sid]
+        if (peer == null) {
+            synchronized(pendingPriv) { if (pendingPriv.size < 20) pendingPriv.add(p) }
+            return
+        }
+        val plain = Crypto.open(keyFor(peer), p.payload, p.sender + p.recipient) ?: return
+        addMessage(ChatMsg(p.id.toHex(), sid, peer.nick, String(plain, Charsets.UTF_8), false, now()))
+        sendAck(p)
+    }
+
+    private fun handleAck(p: Packet) {
+        if (p.payload.size != 16) return
+        val id = p.payload.toHex()
+        synchronized(store) { store.remove(id) }
+        persistStore()
+        if (p.recipient.contentEquals(myId)) {
+            messages.update { l -> l.map { if (it.id == id && it.mine) it.copy(delivered = true) else it } }
+            storage.saveMessages(messages.value)
         }
     }
 
@@ -181,6 +328,55 @@ class MeshManager(private val ctx: Context) {
         if (seen.containsKey(key)) false else { seen[key] = true; true }
     }
 
+    private fun addMessage(m: ChatMsg) {
+        var added = false
+        messages.update { list ->
+            if (list.any { it.id == m.id }) { added = false; list } else { added = true; list + m }
+        }
+        if (!added) return
+        storage.saveMessages(messages.value)
+        if (!m.mine) {
+            if (currentConvo != m.convo) {
+                unread.update { it + (m.convo to ((it[m.convo] ?: 0) + 1)) }
+            }
+            onIncoming?.invoke(m)
+        }
+    }
+
+    // ---------- Store-and-Forward ----------
+    private fun storeAdd(p: Packet) {
+        synchronized(store) {
+            store[p.id.toHex()] = StoredPacket(p.id.toHex(), now(), p.encode())
+            while (store.size > STORE_MAX) {
+                val first = store.keys.iterator().next()
+                store.remove(first)
+            }
+        }
+        persistStore()
+    }
+
+    private fun persistStore() {
+        val snap = synchronized(store) { store.values.toList() }
+        storage.saveStore(snap)
+    }
+
+    private fun storeSnapshot(): List<ByteArray> = synchronized(store) {
+        val cutoff = now() - STORE_TTL_MS
+        store.values.removeAll { it.time < cutoff }
+        store.values.map { it.bytes }
+    }
+
+    private fun flushTo(c: Conn) {
+        storeSnapshot().forEach { c.queue.add(it) }
+        pump(c)
+    }
+
+    private fun flushToSub(d: BluetoothDevice) {
+        storeSnapshot().forEach { notifyQueue.add(d to it) }
+        pumpNotify()
+    }
+
+    // ---------- الإرسال عبر BLE ----------
     private fun forward(bytes: ByteArray) {
         clients.values.forEach { c -> c.queue.add(bytes); pump(c) }
         subscribers.values.forEach { d -> notifyQueue.add(d to bytes) }
@@ -208,21 +404,6 @@ class MeshManager(private val ctx: Context) {
         if (!ok) { notifyBusy.set(false); pumpNotify() }
     }
 
-    private fun buildPayload(text: String): ByteArray {
-        val n = nick.toByteArray(Charsets.UTF_8).copyOf(minOf(12, nick.length))
-        val maxText = MAX_PACKET - Packet.HEADER - 1 - n.size
-        var t = text
-        while (t.toByteArray(Charsets.UTF_8).size > maxText) t = t.dropLast(1)
-        return byteArrayOf(n.size.toByte()) + n + t.toByteArray(Charsets.UTF_8)
-    }
-
-    private fun parsePayload(d: ByteArray): Pair<String, String>? {
-        if (d.isEmpty()) return null
-        val nl = d[0].toInt() and 0xFF
-        if (d.size < 1 + nl) return null
-        return String(d, 1, nl, Charsets.UTF_8) to String(d, 1 + nl, d.size - 1 - nl, Charsets.UTF_8)
-    }
-
     // ---------- callbacks ----------
     private val advCb = object : AdvertiseCallback() {
         override fun onStartFailure(errorCode: Int) { status.value = "Advertise failed: $errorCode" }
@@ -232,7 +413,7 @@ class MeshManager(private val ctx: Context) {
         override fun onConnectionStateChange(device: BluetoothDevice, st: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 subscribers.remove(device.address)
-                updatePeers()
+                updateLinks()
             }
         }
 
@@ -250,9 +431,13 @@ class MeshManager(private val ctx: Context) {
         ) {
             if (descriptor.uuid == CCCD_UUID) {
                 val on = value != null && value.isNotEmpty() && value[0].toInt() != 0
-                if (on) subscribers[device.address] = device else subscribers.remove(device.address)
-                updatePeers()
-                status.value = if (on) "Peer subscribed: ${device.address}" else status.value
+                if (on) {
+                    subscribers[device.address] = device
+                    handler.postDelayed({ announce(); flushToSub(device) }, 500)
+                } else {
+                    subscribers.remove(device.address)
+                }
+                updateLinks()
             }
             if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
         }
@@ -263,16 +448,24 @@ class MeshManager(private val ctx: Context) {
         }
     }
 
-    private val scanCb = object : ScanCallback() {
-        override fun onScanResult(callbackType: Int, result: ScanResult) {
+    private fun onCandidate(result: ScanResult, verify: Boolean) {
+        if (verify) {
             val uuids = result.scanRecord?.serviceUuids ?: return
             if (uuids.none { it.uuid == SERVICE_UUID }) return
-            val addr = result.device.address
-            if (clients.containsKey(addr) || !connecting.add(addr)) return
-            status.value = "Found $addr, connecting…"
-            result.device.connectGatt(ctx, false, gattCb, BluetoothDevice.TRANSPORT_LE)
         }
+        val addr = result.device.address
+        if (clients.containsKey(addr) || !connecting.add(addr)) return
+        status.value = "Found $addr, connecting…"
+        result.device.connectGatt(ctx, false, gattCb, BluetoothDevice.TRANSPORT_LE)
+    }
+
+    private val scanCbFiltered = object : ScanCallback() {
+        override fun onScanResult(callbackType: Int, result: ScanResult) = onCandidate(result, false)
         override fun onScanFailed(errorCode: Int) { status.value = "Scan failed: $errorCode" }
+    }
+
+    private val scanCbOpen = object : ScanCallback() {
+        override fun onScanResult(callbackType: Int, result: ScanResult) = onCandidate(result, true)
     }
 
     private val gattCb = object : BluetoothGattCallback() {
@@ -281,7 +474,6 @@ class MeshManager(private val ctx: Context) {
             if (newState == BluetoothProfile.STATE_CONNECTED && st == BluetoothGatt.GATT_SUCCESS) {
                 status.value = "Connected $addr, discovering…"
                 g.requestMtu(247)
-                // احتياط: بعض الأجهزة ما ترجع onMtuChanged
                 handler.postDelayed({
                     if (connecting.contains(addr) && discovering.add(addr)) g.discoverServices()
                 }, 1500)
@@ -291,7 +483,7 @@ class MeshManager(private val ctx: Context) {
                 clients.remove(addr)
                 connecting.remove(addr)
                 discovering.remove(addr)
-                updatePeers()
+                updateLinks()
             }
         }
 
@@ -306,9 +498,11 @@ class MeshManager(private val ctx: Context) {
                 g.disconnect()
                 return
             }
-            clients[g.device.address] = Conn(g, ch)
+            val conn = Conn(g, ch)
+            clients[g.device.address] = conn
             status.value = "Linked with ${g.device.address}"
-            updatePeers()
+            updateLinks()
+            handler.postDelayed({ announce(); flushTo(conn) }, 500)
         }
 
         override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, st: Int) {
