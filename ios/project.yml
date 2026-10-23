@@ -13,7 +13,8 @@ targets:
       path: MeshLink/Info.plist
       properties:
         CFBundleDisplayName: MeshLink
-        UILaunchScreen: {}
+        UILaunchScreen:
+          UIColorName: LaunchBg
         NSBluetoothAlwaysUsageDescription: "MeshLink uses Bluetooth to chat with nearby devices."
         UIBackgroundModes:
           - bluetooth-central
@@ -22,6 +23,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.meshlink.app
         SWIFT_VERSION: "5.0"
-        MARKETING_VERSION: "0.1.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "0.2.0"
+        CURRENT_PROJECT_VERSION: "2"
         TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
