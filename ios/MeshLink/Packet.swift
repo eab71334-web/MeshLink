@@ -1,5 +1,12 @@
 import Foundation
 
+enum PType {
+    static let publicMsg: UInt8 = 0   // رسالة عامة (نص غير مشفر)
+    static let ack: UInt8 = 1         // تأكيد استلام
+    static let announce: UInt8 = 2    // الاسم + المفتاح العام
+    static let privateMsg: UInt8 = 3  // رسالة خاصة مشفرة
+}
+
 /// نفس شكل الرسالة في docs/PROTOCOL.md (الترويسة 45 بايت)
 struct Packet {
     static let header = 45
